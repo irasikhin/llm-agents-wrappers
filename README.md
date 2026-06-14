@@ -146,3 +146,64 @@ nix run github:irasikhin/llm-agents-wrappers#codex
 The proxy is exported only for the agent process the wrapper launches; your other
 tools are unaffected. The wrapper does not start or manage the proxy service —
 point it at a proxy that is already running.
+
+> The wrapper only *manages* the proxy when `LLM_WRAPPERS_PROXY_*` is set. When
+> it is unset it leaves the ambient environment alone — so if your shell already
+> exports `https_proxy`, the agent inherits it. To guarantee a direct connection
+> regardless of the ambient shell, unset the proxy vars (see the `null` case in
+> the baked snippet below).
+
+### Reproducible proxy (Nix)
+
+Setting `LLM_WRAPPERS_PROXY_*` on the command line is fine for one-offs but not
+reproducible. Two declarative options:
+
+**1. One proxy for all four — set the namespaced vars in your Nix config.**
+Only the wrappers read these names, so this is effectively scoped to them:
+
+```nix
+# home-manager
+home.sessionVariables = {
+  LLM_WRAPPERS_PROXY_HOST = "10.0.0.5";
+  LLM_WRAPPERS_PROXY_PORT = "3128";
+};
+# NixOS: environment.variables = { ... };  (same keys)
+```
+
+**2. Baked into the binaries — per-agent, shared, or forced-direct.**
+Wrap the bundle so each command carries its own proxy in the Nix store, with no
+ambient env needed. Per agent: `{ host; port; }` routes through that proxy,
+`null` forces a direct connection (even if your shell exports a proxy), and an
+agent you omit is left untouched. Give every agent the same value for one shared
+proxy.
+
+```nix
+# `llm-wrappers` = this flake's input; `pkgs` = your nixpkgs.
+let
+  base = llm-wrappers.packages.${pkgs.system}.default;
+  proxies = {
+    claude   = { host = "10.0.0.5"; port = 3128; };
+    codex    = { host = "10.0.0.9"; port = 8080; };
+    opencode = null;                                  # direct, ignore ambient
+    pi       = { host = "127.0.0.1"; port = 8888; };
+  };
+  mkArgs = p:
+    if p == null
+    then "--unset http_proxy --unset https_proxy --unset HTTP_PROXY "
+       + "--unset HTTPS_PROXY --unset all_proxy --unset ALL_PROXY"
+    else "--set LLM_WRAPPERS_PROXY_HOST ${p.host} "
+       + "--set LLM_WRAPPERS_PROXY_PORT ${toString p.port}";
+in
+pkgs.symlinkJoin {
+  name = "llm-wrappers-proxied";
+  paths = [ base ];
+  nativeBuildInputs = [ pkgs.makeWrapper ];
+  postBuild = pkgs.lib.concatStrings (pkgs.lib.mapAttrsToList (name: p: ''
+    rm "$out/bin/${name}"
+    makeWrapper ${base}/bin/${name} "$out/bin/${name}" ${mkArgs p}
+  '') proxies);
+}
+```
+
+Put the result in `environment.systemPackages` / `home.packages`. The proxy is
+fixed at build time, so the binaries are reproducible and self-contained.
