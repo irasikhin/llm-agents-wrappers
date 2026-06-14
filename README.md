@@ -118,6 +118,7 @@ the agent to survive a disconnected terminal.
 | `LLM_WRAPPERS_RUNNER` | `auto` | runner: `auto`, `nix` or `native` |
 | `LLM_WRAPPERS_PROXY_HOST` | _(unset → no proxy)_ | HTTP proxy host; when set, the proxy is exported |
 | `LLM_WRAPPERS_PROXY_PORT` | `8888` (when host set) | HTTP proxy port |
+| `LLM_WRAPPERS_PROXY` | _(unset)_ | `off`/`none`/`direct` forces a direct connection (and clears any ambient proxy) |
 | `CLAUDE_AGENT_FLAKE` | `github:numtide/llm-agents.nix#claude-code` | flakeref run by `claude` (nix runner) |
 | `CODEX_AGENT_FLAKE` | `github:numtide/llm-agents.nix#codex` | flakeref run by `codex` (nix runner) |
 | `OPENCODE_AGENT_FLAKE` | `github:numtide/llm-agents.nix#opencode` | flakeref run by `opencode` (nix runner) |
@@ -126,6 +127,16 @@ the agent to survive a disconnected terminal.
 | `CODEX_NATIVE_BIN` | _(auto-detect on PATH)_ | binary run by `codex` (native runner) |
 | `OPENCODE_NATIVE_BIN` | _(auto-detect on PATH)_ | binary run by `opencode` (native runner) |
 | `PI_NATIVE_BIN` | _(auto-detect on PATH)_ | binary run by `pi` (native runner) |
+
+Every `LLM_WRAPPERS_*` setting has a **per-agent override** named with the agent's
+prefix — `<AGENT>` ∈ `CLAUDE`/`CODEX`/`OPENCODE`/`PI` — which wins over the global:
+
+| Variable | Purpose |
+| --- | --- |
+| `<AGENT>_PROXY_HOST` / `<AGENT>_PROXY_PORT` | per-agent proxy, falling back to the global host/port then the defaults |
+| `<AGENT>_PROXY` | per-agent `off`/`none`/`direct` toggle |
+
+Most-specific wins: `<AGENT>_PROXY=off` › `<AGENT>_PROXY_HOST/PORT` › `LLM_WRAPPERS_PROXY=off` › `LLM_WRAPPERS_PROXY_HOST/PORT` › leave the ambient environment untouched.
 
 ## Proxy
 
@@ -147,27 +158,39 @@ The proxy is exported only for the agent process the wrapper launches; your othe
 tools are unaffected. The wrapper does not start or manage the proxy service —
 point it at a proxy that is already running.
 
-> The wrapper only *manages* the proxy when `LLM_WRAPPERS_PROXY_*` is set. When
-> it is unset it leaves the ambient environment alone — so if your shell already
-> exports `https_proxy`, the agent inherits it. To guarantee a direct connection
-> regardless of the ambient shell, unset the proxy vars (see the `null` case in
-> the baked snippet below).
+Per-agent overrides let you send each agent somewhere different — or force one
+direct while the rest share a proxy:
+
+```bash
+# global proxy for everything, but codex goes direct
+export LLM_WRAPPERS_PROXY_HOST=10.0.0.5 LLM_WRAPPERS_PROXY_PORT=3128
+export CODEX_PROXY=off
+# claude through its own proxy, port falls back to the global 3128
+export CLAUDE_PROXY_HOST=1.2.3.4
+```
+
+`<AGENT>_PROXY=off` (or `LLM_WRAPPERS_PROXY=off`) also *clears* any proxy your
+shell already exported, so a forced-direct agent is hermetic regardless of the
+surrounding environment. When no proxy var is set at all, the wrapper leaves the
+ambient environment untouched.
 
 ### Reproducible proxy (Nix)
 
-Setting `LLM_WRAPPERS_PROXY_*` on the command line is fine for one-offs but not
-reproducible. Two declarative options:
+Setting these on the command line is fine for one-offs but not reproducible. Two
+declarative options:
 
-**1. One proxy for all four — set the namespaced vars in your Nix config.**
-Only the wrappers read these names, so this is effectively scoped to them:
+**1. Session vars in your Nix config — global or per-agent.**
+Only the wrappers read these names, so this is effectively scoped to them. Use
+the global keys for one shared proxy, or the `<AGENT>_*` keys to differ per agent:
 
 ```nix
-# home-manager
+# home-manager (NixOS: environment.variables = { ... }; — same keys)
 home.sessionVariables = {
-  LLM_WRAPPERS_PROXY_HOST = "10.0.0.5";
+  LLM_WRAPPERS_PROXY_HOST = "10.0.0.5";   # shared default for all four
   LLM_WRAPPERS_PROXY_PORT = "3128";
+  CLAUDE_PROXY_HOST = "1.2.3.4";          # claude overrides the host
+  CODEX_PROXY = "off";                     # codex forced direct
 };
-# NixOS: environment.variables = { ... };  (same keys)
 ```
 
 **2. Baked into the binaries — per-agent, shared, or forced-direct.**
@@ -189,8 +212,7 @@ let
   };
   mkArgs = p:
     if p == null
-    then "--unset http_proxy --unset https_proxy --unset HTTP_PROXY "
-       + "--unset HTTPS_PROXY --unset all_proxy --unset ALL_PROXY"
+    then "--set LLM_WRAPPERS_PROXY off"
     else "--set LLM_WRAPPERS_PROXY_HOST ${p.host} "
        + "--set LLM_WRAPPERS_PROXY_PORT ${toString p.port}";
 in
