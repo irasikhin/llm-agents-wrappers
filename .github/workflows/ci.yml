@@ -16,3 +16,50 @@ jobs:
         run: nix flake check --print-build-logs
       - name: nix build default bundle
         run: nix build .#default --print-build-logs
+
+  portable:
+    name: portable (no nix)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ensure shellcheck
+        run: command -v shellcheck >/dev/null 2>&1 || { brew install shellcheck || sudo apt-get update && sudo apt-get install -y shellcheck; }
+
+      - name: shellcheck
+        run: shellcheck bin/llm-agent-wrapper install.sh
+
+      - name: native runner + env injection
+        run: |
+          set -eux
+          tmp=$(mktemp -d)
+          # A stub agent that echoes its first arg and the injected proxy var.
+          printf '#!/bin/sh\nprintf "%%s\\n" "$1"\nprintf "%%s\\n" "${https_proxy:-no-proxy}"\n' > "$tmp/stub"
+          chmod +x "$tmp/stub"
+          ln -s "$PWD/bin/llm-agent-wrapper" "$tmp/claude"
+
+          # native runner, no nix, no real agent: execs the stub with proxy injected
+          out=$(LLM_WRAPPERS_RUNNER=native CLAUDE_NATIVE_BIN="$tmp/stub" \
+                LLM_WRAPPERS_PROXY_HOST=127.0.0.1 "$tmp/claude" hello)
+          test "$out" = "$(printf 'hello\nhttp://127.0.0.1:8888')"
+
+          # self-skip: wrapper symlink named `claude` earlier on PATH than the
+          # stub must NOT exec itself (would loop). Point the stub at name `claude`.
+          ln -s "$tmp/stub" "$tmp/real-claude-dir-claude" 2>/dev/null || true
+          mkdir -p "$tmp/real"
+          ln -s "$tmp/stub" "$tmp/real/claude"
+          out=$(LLM_WRAPPERS_RUNNER=native PATH="$tmp:$tmp/real:$PATH" "$tmp/claude" world)
+          test "$(printf '%s' "$out" | head -n1)" = "world"
+
+      - name: install.sh round-trip
+        run: |
+          set -eux
+          bindir=$(mktemp -d)/bin
+          sh install.sh --bin-dir "$bindir"
+          for a in claude codex opencode pi; do test -L "$bindir/$a"; done
+          sh install.sh --bin-dir "$bindir" --uninstall
+          for a in claude codex opencode pi; do test ! -e "$bindir/$a"; done
