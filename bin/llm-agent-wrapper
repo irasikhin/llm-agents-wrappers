@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 #
 # Proxy-aware multi-call launcher for the Claude, Codex, OpenCode and Pi agent
-# CLIs. It is invoked under one of the names `claude`, `codex`, `opencode` or
-# `pi` (via a symlink) and dispatches on its own basename.
+# CLIs. It is installed under the names `claude-proxy`, `codex-proxy`,
+# `opencode-proxy` and `pi-proxy` (so it never shadows the base `claude`/`codex`/…
+# binaries it launches) and dispatches on its own basename; the bare agent names
+# are also accepted.
 #
 # Behaviour, in order:
-#   1. optionally export a scoped HTTP proxy (opt-in — only when
-#      LLM_WRAPPERS_PROXY_HOST/PORT is set, so a bare machine connects directly),
+#   0. load defaults from a config file (install-time policy; see load_config),
+#   1. optionally export a scoped HTTP proxy (LLM_WRAPPERS_PROXY_HOST/PORT and the
+#      per-agent overrides), or enforce that one is present when proxy is required,
 #   2. force colour into the agent TUI,
 #   3. run the upstream CLI through a selectable runner:
 #        LLM_WRAPPERS_RUNNER=auto    nix if available, else a native binary (default)
@@ -21,17 +24,21 @@ set -euo pipefail
 # when hunting for a native agent binary on PATH.
 WRAPPER_BASENAME="llm-agent-wrapper"
 
-agent=$(basename -- "$0")
+# Installed as `<agent>-proxy`; strip the suffix to get the agent. The bare
+# agent name is accepted too.
+invoked=$(basename -- "$0")
+agent=${invoked%-proxy}
 
-# argv0 -> (upstream llm-agents.nix flake attribute, native binary name)
+# agent -> (upstream llm-agents.nix flake attribute, native binary name)
 case "$agent" in
   claude)   attr="claude-code" ; native="claude"   ;;
   codex)    attr="codex"       ; native="codex"     ;;
   opencode) attr="opencode"    ; native="opencode"  ;;
   pi)       attr="pi"          ; native="pi"         ;;
   *)
-    echo "llm-agent-wrapper: invoked as '$agent', expected one of: claude, codex, opencode, pi" >&2
-    echo "(install via 'install.sh' or the Nix flake so the command names are symlinked correctly)" >&2
+    echo "llm-agent-wrapper: invoked as '$invoked', expected one of:" >&2
+    echo "  claude-proxy, codex-proxy, opencode-proxy, pi-proxy (or the bare names)" >&2
+    echo "(install via 'install.sh' or the Nix flake so the command names are correct)" >&2
     exit 1
     ;;
 esac
@@ -40,15 +47,88 @@ prefix=$(printf '%s' "$agent" | tr '[:lower:]' '[:upper:]')
 
 # Per-agent env overrides, resolved by indirect expansion. Each takes precedence
 # over its global counterpart, so you can configure one agent differently:
-#   <AGENT>_AGENT_FLAKE  - override the flakeref run in nix mode
-#   <AGENT>_NATIVE_BIN   - override the binary run in native mode
-#   <AGENT>_PROXY_HOST   - override LLM_WRAPPERS_PROXY_HOST for this agent
-#   <AGENT>_PROXY_PORT   - override LLM_WRAPPERS_PROXY_PORT for this agent
-#   <AGENT>_PROXY=off    - force a direct connection for this agent
+#   <AGENT>_AGENT_FLAKE     - override the flakeref run in nix mode
+#   <AGENT>_NATIVE_BIN      - override the binary run in native mode
+#   <AGENT>_PROXY_HOST      - override LLM_WRAPPERS_PROXY_HOST for this agent
+#   <AGENT>_PROXY_PORT      - override LLM_WRAPPERS_PROXY_PORT for this agent
+#   <AGENT>_PROXY=off       - force a direct connection for this agent
+#   <AGENT>_REQUIRE_PROXY=1 - refuse to launch this agent without a live proxy
 flake_var="${prefix}_AGENT_FLAKE"
 native_var="${prefix}_NATIVE_BIN"
 flake_override="${!flake_var:-}"
 native_override="${!native_var:-}"
+
+is_truthy() {
+  case "$1" in 1 | true | yes | on | require | required | enable | enabled) return 0 ;; *) return 1 ;; esac
+}
+
+# Load install-time defaults from a config file of `KEY=value` lines (only the
+# LLM_WRAPPERS_* / <AGENT>_* keys, validated charset). The runtime environment
+# wins over the file, except *_REQUIRE_PROXY which is sticky-on (a policy set at
+# install time cannot be silently turned off by the environment).
+load_config() {
+  local file=$1 line key val
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    case "$line" in '' | '#'* | ';'*) continue ;; esac
+    case "$line" in *=*) ;; *) continue ;; esac
+    key=${line%%=*}; val=${line#*=}
+    key=${key// /}; key=${key//$'\t'/}
+    case "$val" in \"*\") val=${val#\"}; val=${val%\"} ;; \'*\') val=${val#\'}; val=${val%\'} ;; esac
+    case "$key" in LLM_WRAPPERS_* | CLAUDE_* | CODEX_* | OPENCODE_* | PI_*) ;; *) continue ;; esac
+    case "$key" in *[!A-Z0-9_]*) continue ;; esac
+    # config provides defaults; an explicit environment value wins.
+    if [ -z "${!key:-}" ]; then export "$key=$val"; fi
+  done < "$file"
+}
+
+# Best-effort external (egress) IP seen *through* the active proxy. Set
+# LLM_WRAPPERS_EGRESS_IP to bypass the probe (manual value / testing).
+probe_egress_ip() {
+  local url ip
+  [ -n "${LLM_WRAPPERS_EGRESS_IP:-}" ] && { printf '%s' "$LLM_WRAPPERS_EGRESS_IP"; return 0; }
+  command -v curl >/dev/null 2>&1 || return 1
+  for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+    if ip=$(curl -fsS --max-time "${LLM_WRAPPERS_EGRESS_TIMEOUT:-8}" "$url" 2>/dev/null); then
+      ip=$(printf '%s' "$ip" | tr -d '[:space:]')
+      [ -n "$ip" ] && { printf '%s' "$ip"; return 0; }
+    fi
+  done
+  return 1
+}
+
+# Interactive yes/no on the controlling terminal. Fail closed (deny) when there
+# is no tty — a non-interactive run must never auto-approve a new proxy.
+confirm_tty() {
+  local prompt=$1 ans
+  [ -r /dev/tty ] || return 1
+  printf '%s' "$prompt" > /dev/tty
+  IFS= read -r ans < /dev/tty || ans=""
+  case "$ans" in y | Y | yes | YES | Yes) return 0 ;; *) return 1 ;; esac
+}
+
+# Probe whether host:port accepts a TCP connection (the proxy is up). Bounded by
+# `timeout`/`gtimeout` when available; otherwise a single bash /dev/tcp attempt
+# (a refused local proxy fails instantly; an unroutable host waits for the OS).
+proxy_reachable() {
+  local host=$1 port=$2 t="${LLM_WRAPPERS_PROXY_TIMEOUT:-3}"
+  # $1/$2 are expanded by the inner `bash -c`, not here, so single quotes are
+  # intentional (shellcheck SC2016).
+  if command -v timeout >/dev/null 2>&1; then
+    # shellcheck disable=SC2016
+    timeout "$t" bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null
+  elif command -v gtimeout >/dev/null 2>&1; then
+    # shellcheck disable=SC2016
+    gtimeout "$t" bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null
+  else
+    (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null
+  fi
+}
+
+# 0. Install-time defaults: explicit file first (wins), then the XDG location.
+load_config "${LLM_WRAPPERS_CONFIG:-}"
+load_config "${XDG_CONFIG_HOME:-$HOME/.config}/llm-wrappers/config"
 
 # Resolve a path to its canonical absolute form, following symlinks, without
 # `readlink -f` (absent on stock macOS).
@@ -179,6 +259,72 @@ case "$proxy_mode" in
     unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
     ;;
 esac
+
+# 1b. Mandatory proxy (fail closed), ON BY DEFAULT. Refuse to launch unless a
+#     proxy is configured AND accepting connections, so the agent can never reach
+#     the API directly. Opt out per agent or globally with
+#     <AGENT>_REQUIRE_PROXY=0 / LLM_WRAPPERS_REQUIRE_PROXY=0 (env or config file).
+require_var="${prefix}_REQUIRE_PROXY"
+require_val="${!require_var:-${LLM_WRAPPERS_REQUIRE_PROXY:-1}}"
+if is_truthy "$require_val"; then
+  if [ "$proxy_mode" != "on" ]; then
+    echo "$agent: a proxy is required but none is configured — refusing to launch." >&2
+    echo "set LLM_WRAPPERS_PROXY_HOST/PORT (or ${prefix}_PROXY_HOST/PORT)," >&2
+    echo "or opt out with LLM_WRAPPERS_REQUIRE_PROXY=0 / ${prefix}_REQUIRE_PROXY=0." >&2
+    exit 1
+  fi
+  if ! proxy_reachable "$proxy_host" "$proxy_port"; then
+    echo "$agent: required proxy http://$proxy_host:$proxy_port is unreachable — refusing to launch." >&2
+    echo "start the proxy, or raise LLM_WRAPPERS_PROXY_TIMEOUT (currently ${LLM_WRAPPERS_PROXY_TIMEOUT:-3}s)." >&2
+    exit 1
+  fi
+fi
+
+# 1c. Egress-IP monitoring. While a proxy is active, check the external IP the
+#     proxy exits from. Approved IPs are remembered; a new/changed egress IP (a
+#     new proxy) raises an alert and must be confirmed interactively before the
+#     launch proceeds — and is then recorded as active. Disable with
+#     LLM_WRAPPERS_EGRESS_CHECK=off.
+if [ "$proxy_mode" = "on" ] && ! is_proxy_off "${LLM_WRAPPERS_EGRESS_CHECK:-on}"; then
+  egress_ip=""
+  if [ -n "${LLM_WRAPPERS_EGRESS_IP:-}" ]; then
+    egress_ip="$LLM_WRAPPERS_EGRESS_IP"
+  else
+    egress_ip=$(probe_egress_ip) || egress_ip=""
+  fi
+  if [ -z "$egress_ip" ]; then
+    echo "$agent: warning: could not determine the proxy's egress IP; skipping egress check." >&2
+  else
+    state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/llm-wrappers"
+    known_file="$state_dir/known-egress"
+    if [ -f "$known_file" ] && grep -qxF "$egress_ip" "$known_file"; then
+      : # already-approved egress
+    else
+      prior="(none yet)"
+      [ -f "$known_file" ] && prior=$(tr '\n' ' ' < "$known_file")
+      {
+        echo "================================================================"
+        echo "⚠  $agent: NEW egress IP via proxy http://$proxy_host:$proxy_port"
+        echo "   egress IP : $egress_ip"
+        echo "   approved  : $prior"
+        echo "   A different external IP means traffic is leaving through a"
+        echo "   different proxy than before."
+        echo "================================================================"
+      } >&2
+      if confirm_tty "Approve this egress IP and continue? [y/N] "; then
+        mkdir -p "$state_dir"
+        printf '%s\n' "$egress_ip" >> "$known_file"
+        printf '%s\t%s\t%s:%s\t%s\n' \
+          "$(date -u +%FT%TZ 2>/dev/null || echo '?')" "$agent" \
+          "$proxy_host" "$proxy_port" "$egress_ip" >> "$state_dir/egress-history"
+        echo "$agent: recorded new egress IP $egress_ip." >&2
+      else
+        echo "$agent: egress IP not approved — refusing to launch." >&2
+        exit 1
+      fi
+    fi
+  fi
+fi
 
 # 2. Force colour into the agent TUI.
 unset NO_COLOR

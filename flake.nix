@@ -33,18 +33,20 @@
           # a broken script.
           script = ./bin/llm-agent-wrapper;
 
+          # Installed as `<name>-proxy` so it never shadows the base `<name>`
+          # binary it launches; the script dispatches on that basename.
           mkAgent =
             name:
             pkgs.runCommandLocal name {
               nativeBuildInputs = [ pkgs.shellcheck ];
               meta = {
                 description = "Proxy-aware ${name} agent-CLI wrapper";
-                mainProgram = name;
+                mainProgram = "${name}-proxy";
                 platforms = lib.platforms.unix;
               };
             } ''
               shellcheck ${script}
-              install -Dm755 ${script} "$out/bin/${name}"
+              install -Dm755 ${script} "$out/bin/${name}-proxy"
             '';
 
           wrappers = lib.genAttrs agents mkAgent;
@@ -56,7 +58,7 @@
             paths = lib.attrValues wrappers;
             meta = {
               description = "Proxy-aware Claude, Codex, OpenCode and Pi agent-CLI wrappers";
-              mainProgram = "claude";
+              mainProgram = "claude-proxy";
               platforms = pkgs.lib.platforms.unix;
             };
           };

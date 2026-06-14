@@ -41,33 +41,65 @@ jobs:
       - name: shellcheck
         run: shellcheck bin/llm-agent-wrapper install.sh
 
-      - name: native runner + env injection
+      - name: native runner + env injection + self-skip
+        env: { LLM_WRAPPERS_REQUIRE_PROXY: "0", LLM_WRAPPERS_EGRESS_CHECK: "off" }
         run: |
           set -eux
           tmp=$(mktemp -d)
-          # A stub agent that echoes its first arg and the injected proxy var.
           printf '#!/bin/sh\nprintf "%%s\\n" "$1"\nprintf "%%s\\n" "${https_proxy:-no-proxy}"\n' > "$tmp/stub"
           chmod +x "$tmp/stub"
-          ln -s "$PWD/bin/llm-agent-wrapper" "$tmp/claude"
+          ln -s "$PWD/bin/llm-agent-wrapper" "$tmp/claude-proxy"
 
           # native runner, no nix, no real agent: execs the stub with proxy injected
           out=$(LLM_WRAPPERS_RUNNER=native CLAUDE_NATIVE_BIN="$tmp/stub" \
-                LLM_WRAPPERS_PROXY_HOST=127.0.0.1 "$tmp/claude" hello)
+                LLM_WRAPPERS_PROXY_HOST=127.0.0.1 "$tmp/claude-proxy" hello)
           test "$out" = "$(printf 'hello\nhttp://127.0.0.1:8888')"
 
-          # self-skip: wrapper symlink named `claude` earlier on PATH than the
-          # stub must NOT exec itself (would loop). Point the stub at name `claude`.
-          ln -s "$tmp/stub" "$tmp/real-claude-dir-claude" 2>/dev/null || true
-          mkdir -p "$tmp/real"
-          ln -s "$tmp/stub" "$tmp/real/claude"
-          out=$(LLM_WRAPPERS_RUNNER=native PATH="$tmp:$tmp/real:$PATH" "$tmp/claude" world)
+          # self-skip: a real `claude` named binary on PATH must be chosen, not
+          # the wrapper. (The -proxy name already can't collide, but bare names can.)
+          ln -s "$PWD/bin/llm-agent-wrapper" "$tmp/claude"
+          mkdir -p "$tmp/real"; ln -s "$tmp/stub" "$tmp/real/claude"
+          out=$(LLM_WRAPPERS_RUNNER=native CLAUDE_PROXY=off PATH="$tmp:$tmp/real:$PATH" "$tmp/claude" world)
           test "$(printf '%s' "$out" | head -n1)" = "world"
 
-      - name: install.sh round-trip
+      - name: mandatory proxy + egress gate (fail closed)
         run: |
           set -eux
-          bindir=$(mktemp -d)/bin
-          sh install.sh --bin-dir "$bindir"
-          for a in claude codex opencode pi; do test -L "$bindir/$a"; done
-          sh install.sh --bin-dir "$bindir" --uninstall
-          for a in claude codex opencode pi; do test ! -e "$bindir/$a"; done
+          tmp=$(mktemp -d); export XDG_STATE_HOME="$tmp/state"
+          printf '#!/bin/sh\necho RAN\n' > "$tmp/stub"; chmod +x "$tmp/stub"
+          ln -s "$PWD/bin/llm-agent-wrapper" "$tmp/claude-proxy"
+          run() { LLM_WRAPPERS_RUNNER=native CLAUDE_NATIVE_BIN="$tmp/stub" "$@"; }
+
+          # 1) no proxy -> refuse (default mandatory)
+          ! out=$(run "$tmp/claude-proxy" 2>&1); echo "$out" | grep -q 'proxy is required'
+
+          # bring up a reachable proxy port
+          python3 -m http.server 8899 --bind 127.0.0.1 >/dev/null 2>&1 & srv=$!; sleep 1
+          P="LLM_WRAPPERS_PROXY_HOST=127.0.0.1 LLM_WRAPPERS_PROXY_PORT=8899"
+
+          # 2) proxy up, new egress IP, non-interactive -> refuse (fail closed)
+          ! out=$(env $P LLM_WRAPPERS_EGRESS_IP=203.0.113.7 \
+                  LLM_WRAPPERS_RUNNER=native CLAUDE_NATIVE_BIN="$tmp/stub" "$tmp/claude-proxy" </dev/null 2>&1)
+          echo "$out" | grep -q 'NEW egress IP'
+
+          # 3) pre-approve that egress IP -> launch
+          mkdir -p "$XDG_STATE_HOME/llm-wrappers"; echo 203.0.113.7 > "$XDG_STATE_HOME/llm-wrappers/known-egress"
+          out=$(env $P LLM_WRAPPERS_EGRESS_IP=203.0.113.7 \
+                LLM_WRAPPERS_RUNNER=native CLAUDE_NATIVE_BIN="$tmp/stub" "$tmp/claude-proxy")
+          test "$out" = RAN
+
+          # 4) unreachable required proxy -> refuse
+          ! env LLM_WRAPPERS_PROXY_HOST=127.0.0.1 LLM_WRAPPERS_PROXY_PORT=9 LLM_WRAPPERS_PROXY_TIMEOUT=2 \
+              LLM_WRAPPERS_RUNNER=native CLAUDE_NATIVE_BIN="$tmp/stub" "$tmp/claude-proxy" 2>&1 | grep -q unreachable
+          kill "$srv" 2>/dev/null || true
+
+      - name: install.sh round-trip (-proxy names + policy)
+        run: |
+          set -eux
+          bindir=$(mktemp -d)/bin; cfg=$(mktemp -d)
+          XDG_CONFIG_HOME="$cfg" sh install.sh --bin-dir "$bindir" --require-proxy --proxy-host 10.0.0.5
+          for a in claude codex opencode pi; do test -L "$bindir/$a-proxy"; done
+          grep -q '^LLM_WRAPPERS_REQUIRE_PROXY=1$' "$cfg/llm-wrappers/config"
+          XDG_CONFIG_HOME="$cfg" sh install.sh --bin-dir "$bindir" --uninstall --purge
+          for a in claude codex opencode pi; do test ! -e "$bindir/$a-proxy"; done
+          test ! -f "$cfg/llm-wrappers/config"
