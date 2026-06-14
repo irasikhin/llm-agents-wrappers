@@ -28,7 +28,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: ensure shellcheck
-        run: command -v shellcheck >/dev/null 2>&1 || { brew install shellcheck || sudo apt-get update && sudo apt-get install -y shellcheck; }
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              brew install shellcheck
+            else
+              sudo apt-get update && sudo apt-get install -y shellcheck
+            fi
+          fi
+          shellcheck --version
 
       - name: shellcheck
         run: shellcheck bin/llm-agent-wrapper install.sh
