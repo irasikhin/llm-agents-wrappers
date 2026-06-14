@@ -1,5 +1,7 @@
 # llm-wrappers
 
+[![ci](https://github.com/irasikhin/llm-agents-wrappers/actions/workflows/ci.yml/badge.svg)](https://github.com/irasikhin/llm-agents-wrappers/actions/workflows/ci.yml)
+
 Proxy-aware wrappers for LLM coding agents. One small launcher gives you four
 commands — `claude`, `codex`, `opencode`, `pi` — that each:
 
@@ -72,10 +74,12 @@ nix run github:irasikhin/llm-agents-wrappers#opencode
 nix run github:irasikhin/llm-agents-wrappers#pi
 ```
 
-Install into your profile (the `default` bundle installs all four):
+Install into your profile (the `default` bundle installs all four; or pick
+individual commands):
 
 ```bash
 nix profile install github:irasikhin/llm-agents-wrappers#default
+nix profile install github:irasikhin/llm-agents-wrappers#claude
 ```
 
 Use from another flake:
@@ -90,6 +94,12 @@ Use from another flake:
 environment.systemPackages = [
   llm-wrappers.packages.${pkgs.system}.default
 ];
+```
+
+For local development, point a flake input at a clone:
+
+```nix
+inputs.llm-wrappers.url = "path:.";
 ```
 
 With Nix present, the wrappers default to the `nix run` path and pull each agent
